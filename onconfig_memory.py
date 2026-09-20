@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""apply_onconfig_fix.py [RAM_IN_GB] [ONCONFIG_PATH]"""
 import os
 import re
 import sys
@@ -8,6 +7,8 @@ from pathlib import Path
  
 ONCONFIG_FILE = Path(sys.argv[2] if len(sys.argv) > 2 else "/opt/IBM/informix/etc/onconfig.local")
 SYSCTL_FILE = Path("/etc/sysctl.d/99-informix-hugepages.conf")
+LIMITS_FILE = Path("/etc/security/limits.d/99-informix-memlock.conf")
+PROFILE_FILE = Path("/etc/profile.d/profile.local.sh")
  
  
 def meminfo():
@@ -22,8 +23,7 @@ def meminfo():
 def ram_kb_from_args_or_host():
     if len(sys.argv) > 1 and sys.argv[1].isdigit():
         return int(sys.argv[1]) * 1024 * 1024
-    info = meminfo()
-    return info.get("MemTotal", 0)
+    return meminfo().get("MemTotal", 0)
  
  
 def replace_or_append(text, key, line):
@@ -47,6 +47,19 @@ def comment_shmvisize(text):
     return re.sub(r"^SHMVSIZE(\s+.*)$", r"# SHMVSIZE\1", text, flags=re.M)
  
  
+def set_profile_export(name, value):
+    if not PROFILE_FILE.is_file():
+        return
+    text = PROFILE_FILE.read_text()
+    line = "export {}={}".format(name, value)
+    pat = re.compile(r"^(export\s+)?" + re.escape(name) + r"=.*$", re.M)
+    if pat.search(text):
+        text = pat.sub(line, text)
+    else:
+        text = text.rstrip() + "\n" + line + "\n"
+    PROFILE_FILE.write_text(text)
+ 
+ 
 def main():
     ram_kb = ram_kb_from_args_or_host()
     if ram_kb < 4 * 1024 * 1024:
@@ -55,6 +68,7 @@ def main():
  
     info = meminfo()
     hp_kb = info.get("Hugepagesize", 2048) or 2048
+    informix_gid = int(os.popen("id -g informix").read().strip())
  
     inform_ram_kb = ram_kb * 80 // 100
     shmtotal_kb = (inform_ram_kb + hp_kb - 1) // hp_kb * hp_kb
@@ -97,7 +111,7 @@ def main():
     text = replace_or_append(text, "SHMTOTAL", "SHMTOTAL    {}".format(shmtotal_kb))
     text = replace_or_append(text, "SHMADD", "SHMADD      {}".format(shmadd))
     text = replace_or_append(text, "EXTSHMADD", "EXTSHMADD   {}".format(extshmadd))
-    text = replace_or_append(text, "RESIDENT", "RESIDENT    1")
+    text = replace_or_append(text, "RESIDENT", "RESIDENT    -1")
     text = replace_or_append(
         text,
         "BUFFERPOOL",
@@ -107,23 +121,30 @@ def main():
     )
     ONCONFIG_FILE.write_text(text)
  
+    LIMITS_FILE.write_text(
+        "informix soft memlock unlimited\ninformix hard memlock unlimited\n"
+    )
+    set_profile_export("IFX_LARGE_PAGES", "1")
+ 
     cur_hp = int(Path("/proc/sys/vm/nr_hugepages").read_text().strip() or "0")
-    SYSCTL_FILE.write_text("vm.nr_hugepages = {}\n".format(nr_hp))
+    SYSCTL_FILE.write_text(
+        "vm.nr_hugepages = {}\nvm.hugetlb_shm_group = {}\n".format(nr_hp, informix_gid)
+    )
     if cur_hp < nr_hp:
         Path("/proc/sys/vm/drop_caches").write_text("3")
-    if cur_hp != nr_hp:
-        Path("/proc/sys/vm/nr_hugepages").write_text(str(nr_hp))
+    os.system("sysctl -p {}".format(SYSCTL_FILE))
     got = int(Path("/proc/meminfo").read_text().split("HugePages_Total:")[1].split()[0])
     if got < nr_hp:
         print("Fehler: HugePages_Total={} < {}".format(got, nr_hp), file=sys.stderr)
         sys.exit(1)
  
     print(
-        "RAM {} KB | SHMTOTAL {} | BUFFER {}-{} MB | nr_hugepages {}".format(
-            ram_kb, shmtotal_kb, buffer_start_mb, buffer_max_mb, nr_hp
+        "RAM {} KB | SHMTOTAL {} | BUFFER {}-{} MB | nr_hugepages {} | RESIDENT -1 | hugetlb_shm_group {}".format(
+            ram_kb, shmtotal_kb, buffer_start_mb, buffer_max_mb, nr_hp, informix_gid
         )
     )
     print("Aktualisiert:", ONCONFIG_FILE)
+    print("oninit mit: export IFX_LARGE_PAGES=1; ulimit -l unlimited; oninit")
  
  
 if __name__ == "__main__":
