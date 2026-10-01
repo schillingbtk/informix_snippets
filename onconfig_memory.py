@@ -9,6 +9,8 @@ SYSCTL_FILE = Path("/etc/sysctl.d/99-informix-hugepages.conf")
 LIMITS_FILE = Path("/etc/security/limits.d/99-informix-memlock.conf")
 PROFILE_FILE = Path("/etc/profile.d/profile.local.sh")
 OS_MIN_KB = 3 * 1024 * 1024
+WG_SHM_KB = 16 * 1024 * 1024
+BUFFER_POOLS = 2
 
 
 def meminfo():
@@ -30,17 +32,15 @@ def dimension(ram_kb, hp_kb):
     hp_kb = hp_kb or 2048
     os_reserve_kb = max(OS_MIN_KB, ram_kb * 25 // 100)
     inform_ram_kb = ram_kb - os_reserve_kb
-    shmtotal_kb = inform_ram_kb // hp_kb * hp_kb
+    capped_kb = inform_ram_kb if inform_ram_kb < WG_SHM_KB else WG_SHM_KB
+    shmtotal_kb = capped_kb // hp_kb * hp_kb
     if ram_kb >= 32 * 1024 * 1024:
         shmadd, extshmadd = 262144, 65536
     else:
         shmadd, extshmadd = 131072, 32768
-    buffer_max_mb = shmtotal_kb * 70 // 100 // 1024
-    buffer_start_mb = buffer_max_mb * 30 // 100
-    if buffer_start_mb < 512:
-        buffer_start_mb = 512
-    if buffer_start_mb > buffer_max_mb:
-        buffer_start_mb = buffer_max_mb
+    buffer_total_mb = shmtotal_kb * 70 // 100 // 1024
+    buffer_max_mb = buffer_total_mb // BUFFER_POOLS
+    buffer_start_mb = 512 if buffer_max_mb > 512 else buffer_max_mb
     nr_hugepages = shmtotal_kb // hp_kb + (shmadd + hp_kb - 1) // hp_kb
     return {
         "os_reserve_kb": os_reserve_kb,
@@ -98,20 +98,20 @@ def self_check():
     assert d8["shmtotal_kb"] % hp == 0
     assert d8["nr_hugepages"] == d8["shmtotal_kb"] // hp + (d8["shmadd"] + hp - 1) // hp
     assert d8["nr_hugepages"] * hp <= 8 * 1024 * 1024 - os8 + d8["shmadd"] + hp - 1
-    assert d8["buffer_max_mb"] == d8["shmtotal_kb"] * 70 // 100 // 1024
-    start = d8["buffer_max_mb"] * 30 // 100
-    if start < 512:
-        start = 512
-    if start > d8["buffer_max_mb"]:
-        start = d8["buffer_max_mb"]
-    assert d8["buffer_start_mb"] == start
+    assert d8["buffer_max_mb"] == (d8["shmtotal_kb"] * 70 // 100 // 1024) // BUFFER_POOLS
+    assert d8["buffer_max_mb"] * BUFFER_POOLS * 1024 <= d8["shmtotal_kb"] * 70 // 100
+    assert d8["buffer_start_mb"] == 512
+    assert d8["shmtotal_kb"] < WG_SHM_KB
     assert d8["shmadd"] == 131072
     d64 = dimension(64 * 1024 * 1024, hp)
     os64 = max(OS_MIN_KB, 64 * 1024 * 1024 * 25 // 100)
     assert d64["os_reserve_kb"] == os64 == 16 * 1024 * 1024
-    assert d64["shmtotal_kb"] == (64 * 1024 * 1024 - os64) // hp * hp
+    assert d64["shmtotal_kb"] == WG_SHM_KB
+    assert d64["shmtotal_kb"] < (64 * 1024 * 1024 - os64)
+    assert d64["buffer_start_mb"] == 512
     assert d64["shmadd"] == 262144
-    assert d64["buffer_max_mb"] == d64["shmtotal_kb"] * 70 // 100 // 1024
+    assert d64["buffer_max_mb"] == (d64["shmtotal_kb"] * 70 // 100 // 1024) // BUFFER_POOLS
+    assert d64["buffer_max_mb"] * BUFFER_POOLS * 1024 <= d64["shmtotal_kb"] * 70 // 100
     print("self-check ok")
 
 
